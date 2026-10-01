@@ -1,0 +1,1 @@
+"""Desktop fuel-price history tracker."""
