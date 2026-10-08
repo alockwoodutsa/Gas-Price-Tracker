@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import tkinter as tk
+from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -21,6 +22,15 @@ WHITE = "#ffffff"
 GREEN = "#16745b"
 ORANGE = "#d4773d"
 GRID = "#e5e9e4"
+HISTORICAL_EVENTS = (
+    ("1990-08-02", "Gulf War"),
+    ("2003-03-20", "Iraq invasion begins"),
+    ("2005-08-29", "Hurricane Katrina"),
+    ("2008-07-11", "Oil-price peak"),
+    ("2020-03-11", "COVID-19 pandemic"),
+    ("2022-02-24", "Ukraine invasion"),
+    ("2026-02-28", "Iran war begins"),
+)
 
 
 def default_database_path() -> Path:
@@ -44,9 +54,12 @@ class GasPriceApp:
         self.fuel = tk.StringVar(value="Regular gasoline")
         self.region = tk.StringVar(value="U.S. average (NUS)")
         self.api_key = tk.StringVar(value=load_eia_api_key())
+        self.show_events = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Choose a source and refresh to load price history.")
         self.region_ids = {"U.S. average (NUS)": "NUS"}
         self.busy = False
+        self.hover_index: int | None = None
+        self.hover_items: tuple[int, int] | None = None
 
         self._build()
         self._draw_history()
@@ -104,11 +117,19 @@ class GasPriceApp:
         chart_header = tk.Frame(chart_frame, bg=WHITE, padx=18, pady=14)
         chart_header.pack(fill="x")
         tk.Label(chart_header, text="Weekly average · USD per gallon", bg=WHITE, fg=INK, font=("Segoe UI", 12, "bold")).pack(side="left")
+        ttk.Checkbutton(
+            chart_header,
+            text="Historical events",
+            variable=self.show_events,
+            command=self._draw_history,
+        ).pack(side="right", padx=(12, 0))
         self.range_label = tk.Label(chart_header, text="HISTORY", bg=WHITE, fg=MUTED, font=("Segoe UI", 9, "bold"))
         self.range_label.pack(side="right")
         self.canvas = tk.Canvas(chart_frame, bg=WHITE, height=330, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         self.canvas.bind("<Configure>", lambda _event: self._draw_history())
+        self.canvas.bind("<Motion>", self._show_history_hover)
+        self.canvas.bind("<Leave>", lambda _event: self._hide_history_hover())
 
         self.status_label = tk.Label(outer, textvariable=self.status, bg=PAPER, fg=MUTED, anchor="w", font=("Segoe UI", 9))
         self.status_label.pack(fill="x", pady=(12, 0))
@@ -163,8 +184,11 @@ class GasPriceApp:
     def _draw_history(self) -> None:
         source, product, region = self._selection()
         points = self.store.history(source, product, region)
+        self.chart_points = points
         self.points_value.configure(text=f"{len(points):,}")
         self.canvas.delete("all")
+        self.hover_index = None
+        self.hover_items = None
         if not points:
             self.current_value.configure(text="--")
             self.change_value.configure(text="--")
@@ -185,6 +209,69 @@ class GasPriceApp:
         self.range_label.configure(text=f"{points[0].period}  —  {latest.period}")
         self._plot(points)
 
+    def _show_history_hover(self, event: tk.Event) -> None:
+        points = self.chart_points
+        if not points:
+            return
+
+        width = max(self.canvas.winfo_width(), 400)
+        height = max(self.canvas.winfo_height(), 240)
+        left, right, top, bottom = 62, width - 22, 18, height - 42
+        if not left <= event.x <= right or not top <= event.y <= bottom:
+            self._hide_history_hover()
+            return
+
+        fraction = (event.x - left) / (right - left)
+        index = round(fraction * max(len(points) - 1, 0))
+        if index == self.hover_index:
+            return
+
+        point = points[index]
+        tooltip_width, tooltip_height = 156, 42
+        tooltip_x = min(event.x + 12, width - tooltip_width - 4)
+        tooltip_y = max(event.y - tooltip_height - 10, 4)
+        if self.hover_items is None:
+            rectangle = self.canvas.create_rectangle(
+                tooltip_x,
+                tooltip_y,
+                tooltip_x + tooltip_width,
+                tooltip_y + tooltip_height,
+                fill=INK,
+                outline=INK,
+                tags="hover",
+            )
+            text = self.canvas.create_text(
+                tooltip_x + 9,
+                tooltip_y + 7,
+                text="",
+                anchor="nw",
+                fill=WHITE,
+                font=("Segoe UI", 9, "bold"),
+                tags="hover",
+            )
+            self.hover_items = (rectangle, text)
+
+        rectangle, text = self.hover_items
+        self.canvas.coords(
+            rectangle,
+            tooltip_x,
+            tooltip_y,
+            tooltip_x + tooltip_width,
+            tooltip_y + tooltip_height,
+        )
+        self.canvas.coords(text, tooltip_x + 9, tooltip_y + 7)
+        self.canvas.itemconfigure(text, text=f"{point.period}\n${point.price:.3f} per gallon")
+        self.canvas.itemconfigure(rectangle, state="normal")
+        self.canvas.itemconfigure(text, state="normal")
+        self.hover_index = index
+
+    def _hide_history_hover(self) -> None:
+        if self.hover_items is None or self.hover_index is None:
+            return
+        for item in self.hover_items:
+            self.canvas.itemconfigure(item, state="hidden")
+        self.hover_index = None
+
     def _plot(self, points: list[PricePoint]) -> None:
         width = max(self.canvas.winfo_width(), 400)
         height = max(self.canvas.winfo_height(), 240)
@@ -195,6 +282,22 @@ class GasPriceApp:
         low -= spread * 0.12
         high += spread * 0.12
 
+        plot_indexes = list(range(len(points)))
+        if len(points) > right - left:
+            bucket_count = max((right - left) // 2, 1)
+            bucket_size = (len(points) + bucket_count - 1) // bucket_count
+            plot_indexes = {0, len(points) - 1}
+            for start in range(0, len(points), bucket_size):
+                end = min(start + bucket_size, len(points))
+                bucket_indexes = range(start, end)
+                plot_indexes.update(
+                    (
+                        min(bucket_indexes, key=lambda index: values[index]),
+                        max(bucket_indexes, key=lambda index: values[index]),
+                    )
+                )
+            plot_indexes = sorted(plot_indexes)
+
         for tick in range(5):
             fraction = tick / 4
             y = bottom - fraction * (bottom - top)
@@ -204,15 +307,51 @@ class GasPriceApp:
 
         coords = []
         last_index = max(len(points) - 1, 1)
-        for index, point in enumerate(points):
+        for index in plot_indexes:
+            point = points[index]
             x = left + index / last_index * (right - left)
             y = bottom - (point.price - low) / (high - low) * (bottom - top)
             coords.extend((x, y))
         if len(coords) >= 4:
-            self.canvas.create_line(*coords, fill=GREEN, width=3, smooth=True, splinesteps=16)
+            self.canvas.create_line(*coords, fill=GREEN, width=3)
+        self._draw_event_markers(points, left, right, top, bottom)
         self.canvas.create_oval(coords[-2] - 4, coords[-1] - 4, coords[-2] + 4, coords[-1] + 4, fill=ORANGE, outline=WHITE, width=2)
         self.canvas.create_text(left, bottom + 18, text=points[0].period, anchor="w", fill=MUTED, font=("Segoe UI", 8))
         self.canvas.create_text(right, bottom + 18, text=points[-1].period, anchor="e", fill=MUTED, font=("Segoe UI", 8))
+
+    def _draw_event_markers(self, points: list[PricePoint], left: int, right: int, top: int, bottom: int) -> None:
+        if not self.show_events.get():
+            return
+
+        try:
+            point_dates = [datetime.strptime(point.period, "%Y-%m-%d").date() for point in points]
+        except ValueError:
+            return
+
+        first_date, last_date = point_dates[0], point_dates[-1]
+        last_index = max(len(points) - 1, 1)
+        for event_number, (date_text, label) in enumerate(HISTORICAL_EVENTS):
+            event_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+            if not first_date <= event_date <= last_date:
+                continue
+
+            index = bisect_left(point_dates, event_date)
+            if index and (index == len(point_dates) or event_date - point_dates[index - 1] < point_dates[index] - event_date):
+                index -= 1
+            x = left + index / last_index * (right - left)
+            self.canvas.create_line(x, top, x, bottom, fill=ORANGE, dash=(5, 4), width=1, tags="event")
+            anchor = "nw" if x < (left + right) / 2 else "ne"
+            label_x = x + 4 if anchor == "nw" else x - 4
+            label_y = top + 4 + (event_number % 2) * 18
+            self.canvas.create_text(
+                label_x,
+                label_y,
+                text=f"{event_date.year} {label}",
+                anchor=anchor,
+                fill=ORANGE,
+                font=("Segoe UI", 8, "bold"),
+                tags="event",
+            )
 
     def refresh(self) -> None:
         if self.busy:
